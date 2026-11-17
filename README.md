@@ -2,7 +2,7 @@
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ToanLee5433/BTL_KPDL_Nhom7/blob/main/Wholesale_Customers_Clustering.ipynb)
 
-Bài tập lớn môn Khai phá dữ liệu (nhóm 4 người) — **bài toán Phân cụm** trên bộ dữ liệu **Wholesale Customers (UCI, 440 dòng)** sử dụng **K-Means, Hierarchical Clustering (Ward) và DBSCAN**; thực nghiệm trên Google Colab và ứng dụng web Python + Streamlit.
+Bài tập lớn môn Khai phá dữ liệu (nhóm 5 người) — **bài toán Phân cụm** trên bộ dữ liệu **Wholesale Customers (UCI, 440 dòng)** sử dụng **K-Means, Hierarchical Clustering (Ward) và DBSCAN**; thực nghiệm trên Google Colab và ứng dụng web Python + Streamlit.
 
 ## Kết quả chính (phiên bản hoàn thiện)
 
@@ -66,7 +66,7 @@ Chỉ huấn luyện khi có ít nhất 10 khách hàng mới (`--min-new`) ho�
 - `app.py`, `experience.py`: Giao diện web Streamlit 4 tab.
 - `retrain.py`: Script huấn luyện lại theo dòng lệnh / Task Scheduler.
 - `build_notebook.py`: Tạo `Wholesale_Customers_Clustering.ipynb` cho Google Colab.
-- `docs/BAO_CAO.md`: Báo cáo chi tiết bài tập lớn (6 chương) & bảng phân công 4 thành viên.
+- `docs/BAO_CAO.md`: Báo cáo chi tiết bài tập lớn (6 chương) & bảng phân công 5 thành viên.
 - `tests/test_system.py`: Bộ kiểm thử tự động (`python -m pytest tests -q`).
 - `data/wholesale_customers.csv`: Bộ dữ liệu gốc UCI (440 dòng).
 
