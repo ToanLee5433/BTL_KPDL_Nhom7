@@ -17,9 +17,7 @@ def code(text):
     cells.append(nbf.v4.new_code_cell(text.strip()))
 
 
-PROJECT_FILES = {name: (ROOT / name).read_text(encoding='utf-8') for name in
-                 ['pipeline.py', 'storage.py', 'experience.py', 'app.py', 'retrain.py']}
-EMBEDDED_CSV = (ROOT / 'data' / 'wholesale_customers.csv').read_text(encoding='utf-8')
+REPO_URL = 'https://github.com/ToanLee5433/BTL_KPDL_Nhom7.git'
 
 md('''# Bài tập lớn Khai phá dữ liệu — Bài toán Phân cụm
 ## Đề tài: Phân khúc khách hàng siêu thị để gợi ý khuyến mãi
@@ -68,32 +66,31 @@ Bộ dữ liệu gồm **440 khách hàng**, mỗi dòng là tổng chi tiêu tr
 
 6 cột chi tiêu được dùng để tính khoảng cách phân cụm; `Channel` và `Region` dùng để mô tả và đối chiếu đặc điểm các cụm.''')
 
-code('EMBEDDED_CSV = ' + repr(EMBEDDED_CSV) + '''
+code('''# Tải mã nguồn & dữ liệu từ GitHub (hoặc dùng thư mục hiện tại nếu chạy trên máy cá nhân)
+import subprocess
+REPO_URL = 'https://github.com/ToanLee5433/BTL_KPDL_Nhom7.git'
+if (WORK / 'pipeline.py').exists() and (WORK / 'data' / 'wholesale_customers.csv').exists():
+    PROJECT_DIR = WORK
+elif not (PROJECT_DIR / 'pipeline.py').exists():
+    shutil.rmtree(PROJECT_DIR, ignore_errors=True)
+    subprocess.run(['git', 'clone', '--depth', '1', REPO_URL, str(PROJECT_DIR)], check=True)
 
-URL = 'https://archive.ics.uci.edu/static/public/292/wholesale+customers.zip'
-try:
-    req = urllib.request.Request(URL, headers={'User-Agent': 'Mozilla/5.0'})
-    with urllib.request.urlopen(req, timeout=20) as response:
-        archive_bytes = response.read()
-    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as archive:
-        csv_name = next(name for name in archive.namelist() if name.endswith('.csv'))
-        raw_bytes = archive.read(csv_name)
-    source = 'UCI (tải trực tiếp)'
-except Exception as error:
-    raw_bytes = EMBEDDED_CSV.encode('utf-8')
-    source = f'Bản nhúng sẵn trong notebook ({type(error).__name__})'
-
-(PROJECT_DIR / 'data' / 'wholesale_customers.csv').write_bytes(raw_bytes)
-print('Nguồn dữ liệu:', source)''')
-
-code('# Ghi mã nguồn ứng dụng dùng chung (pipeline.py, app.py, storage.py, experience.py, retrain.py)\n'
-     'PROJECT_FILES = ' + repr(PROJECT_FILES) + '''
-for name, text in PROJECT_FILES.items():
-    (PROJECT_DIR / name).write_text(text, encoding='utf-8')
 sys.path.insert(0, str(PROJECT_DIR))
 import importlib, pipeline
 importlib.reload(pipeline)
 from pipeline import *
+
+# Thử tải trực tiếp từ UCI; nếu mạng UCI chậm/lỗi thì dùng file CSV chuẩn đi kèm trong repo
+URL = 'https://archive.ics.uci.edu/static/public/292/wholesale+customers.zip'
+try:
+    req = urllib.request.Request(URL, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=15) as response:
+        with zipfile.ZipFile(io.BytesIO(response.read())) as archive:
+            csv_name = next(name for name in archive.namelist() if name.endswith('.csv'))
+            (PROJECT_DIR / 'data' / 'wholesale_customers.csv').write_bytes(archive.read(csv_name))
+    print('Nguồn dữ liệu: Tải trực tiếp từ UCI')
+except Exception:
+    print('Nguồn dữ liệu: Dùng data/wholesale_customers.csv từ GitHub repo')
 
 raw = pd.read_csv(PROJECT_DIR / 'data' / 'wholesale_customers.csv')
 data = validate(raw)
