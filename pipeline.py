@@ -1,10 +1,10 @@
-"""Pipeline phân cụm dùng chung cho notebook Colab, giao diện Streamlit và lịch huấn luyện lại.
+"""Pipeline phân cụm RFM cho bộ dữ liệu Online Retail (UCI 352).
 
-Đề tài: Phân khúc khách hàng siêu thị để gợi ý khuyến mãi (Bài toán Phân cụm).
-Dữ liệu: Wholesale Customers (UCI, 440 dòng, 6 nhóm chi tiêu + Channel, Region).
-Luồng chuẩn: validate -> loại ngoại lai (IQR) -> chuẩn hóa (StandardScaler / MinMaxScaler)
-             -> K-Means / Hierarchical (Agglomerative) / DBSCAN -> đánh giá (Elbow, Silhouette)
-             -> hồ sơ phân khúc & gợi ý khuyến mãi -> lưu phiên kết quả.
+Đề tài: Phân khúc khách hàng bán lẻ (mô hình RFM) để gợi ý khuyến mãi.
+Luồng chuẩn: Làm sạch giao dịch (nếu từ raw Excel) -> Tổng hợp RFM (Recency, Frequency, Monetary)
+             -> Loại ngoại lai (IQR) -> Chuẩn hóa (StandardScaler / MinMaxScaler)
+             -> K-Means / Hierarchical (Ward) / DBSCAN -> Đánh giá (Elbow, Silhouette)
+             -> Đặt tên phân khúc RFM & Gợi ý khuyến mãi -> Lưu phiên kết quả.
 """
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,62 +23,91 @@ from sklearn.pipeline import Pipeline
 from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
 from sklearn.decomposition import PCA
 
-FEATURES = ['Fresh', 'Milk', 'Grocery', 'Frozen', 'Detergents_Paper', 'Delicassen']
-COLUMNS = ['Channel', 'Region'] + FEATURES
-CATEGORY_VI = {
-    'Fresh': 'Hàng tươi sống',
-    'Milk': 'Sữa & chế phẩm',
-    'Grocery': 'Tạp hóa',
-    'Frozen': 'Hàng đông lạnh',
-    'Detergents_Paper': 'Chất tẩy rửa & giấy',
-    'Delicassen': 'Thực phẩm chế biến',
+FEATURES = ['Recency', 'Frequency', 'Monetary']
+COLUMNS = ['CustomerID', 'Recency', 'Frequency', 'Monetary', 'TotalItems', 'Country']
+FEATURE_VI = {
+    'Recency': 'Số ngày từ lần mua cuối (Recency)',
+    'Frequency': 'Số đơn hàng đã mua (Frequency)',
+    'Monetary': 'Tổng chi tiêu £ (Monetary)',
 }
-FOOD = ['Fresh', 'Frozen', 'Delicassen']
-RETAIL = ['Milk', 'Grocery', 'Detergents_Paper']
 ROOT = Path(__file__).resolve().parent
-SOURCE = ROOT / 'data' / 'wholesale_customers.csv'
+SOURCE = ROOT / 'data' / 'online_retail_rfm.csv'
+RAW_EXCEL = ROOT / 'data' / 'Online Retail.xlsx'
 
-# Bắt buộc >= 3 cụm để phân khúc có ý nghĩa thiết kế khuyến mãi (k=2 chỉ tách 2 kênh Channel có sẵn).
+# Bắt buộc >= 3 cụm cho phân khúc RFM để tách rõ: Trung thành / Mới-Tiềm năng / Nguy cơ rời bỏ.
 MIN_SEGMENTS = 3
 
 
-# --------------------------------------------------------------------------- 1. Kiểm tra dữ liệu
+# --------------------------------------------------------------------------- 1. Làm sạch & Tổng hợp RFM
+def build_rfm_from_raw(raw_df):
+    """Làm sạch 541,909 giao dịch thô và tổng hợp thành bảng RFM theo CustomerID."""
+    stats = {'raw_rows': int(len(raw_df))}
+    df = raw_df.dropna(subset=['CustomerID']).copy()
+    stats['missing_customer_id'] = stats['raw_rows'] - int(len(df))
+    df['InvoiceNo'] = df['InvoiceNo'].astype(str)
+    cancelled = df['InvoiceNo'].str.startswith('C')
+    stats['cancelled_invoices'] = int(cancelled.sum())
+    df = df[~cancelled].copy()
+    invalid_qp = (df['Quantity'] <= 0) | (df['UnitPrice'] <= 0)
+    stats['invalid_qty_price'] = int(invalid_qp.sum())
+    df = df[~invalid_qp].copy()
+    stats['clean_transactions'] = int(len(df))
+
+    df['TotalPrice'] = df['Quantity'] * df['UnitPrice']
+    df['InvoiceDate'] = pd.to_datetime(df['InvoiceDate'])
+    ref_date = df['InvoiceDate'].max() + pd.Timedelta(days=1)
+
+    rfm = df.groupby('CustomerID').agg(
+        Recency=('InvoiceDate', lambda x: int((ref_date - x.max()).days)),
+        Frequency=('InvoiceNo', 'nunique'),
+        Monetary=('TotalPrice', 'sum'),
+        TotalItems=('Quantity', 'sum'),
+        Country=('Country', lambda x: str(x.mode().iloc[0])),
+    ).reset_index()
+    rfm['CustomerID'] = rfm['CustomerID'].astype(int)
+    stats['rfm_customers'] = int(len(rfm))
+    return rfm, stats
+
+
 def validate(raw):
     if raw.columns.duplicated().any():
         raise ValueError('Tên cột bị lặp; cần mỗi cột xuất hiện đúng một lần.')
     missing = set(COLUMNS) - set(raw.columns)
     if missing:
         raise ValueError(f'Thiếu cột: {sorted(missing)}')
-    frame = raw[COLUMNS].apply(pd.to_numeric, errors='coerce')
+    frame = raw[COLUMNS].copy()
     if frame.empty:
         raise ValueError('Dữ liệu rỗng.')
-    if not np.isfinite(frame.to_numpy(dtype=float)).all():
-        raise ValueError('Dữ liệu có ô thiếu, chữ hoặc giá trị vô hạn. Hãy sửa trước khi lưu.')
-    if (frame[FEATURES] < 0).any().any():
-        raise ValueError('Chi tiêu không được âm.')
-    if (frame[FEATURES].sum(axis=1) == 0).any():
-        raise ValueError('Mỗi khách hàng cần có chi tiêu dương ở ít nhất một nhóm hàng.')
-    if not frame.Channel.isin([1, 2]).all() or not frame.Region.isin([1, 2, 3]).all():
-        raise ValueError('Channel chỉ nhận 1/2; Region chỉ nhận 1/2/3.')
-    frame[['Channel', 'Region']] = frame[['Channel', 'Region']].astype(int)
-    frame[FEATURES] = frame[FEATURES].astype(float)
+    num_cols = ['CustomerID', 'Recency', 'Frequency', 'Monetary', 'TotalItems']
+    frame[num_cols] = frame[num_cols].apply(pd.to_numeric, errors='coerce')
+    if not np.isfinite(frame[num_cols].to_numpy(dtype=float)).all():
+        raise ValueError('Dữ liệu số có ô thiếu, chữ hoặc giá trị vô hạn.')
+    if (frame['CustomerID'] <= 0).any():
+        raise ValueError('CustomerID phải là số nguyên dương.')
+    if (frame['Recency'] < 0).any():
+        raise ValueError('Recency (số ngày) không được âm.')
+    if (frame['Frequency'] < 1).any():
+        raise ValueError('Frequency (số đơn hàng) phải >= 1.')
+    if (frame['Monetary'] <= 0).any():
+        raise ValueError('Monetary (tổng chi tiêu) phải > 0.')
+    if (frame['TotalItems'] < 1).any():
+        raise ValueError('TotalItems (tổng số sản phẩm) phải >= 1.')
+    frame['Country'] = frame['Country'].fillna('Unknown').astype(str).str.strip()
+    frame[['CustomerID', 'Recency', 'Frequency', 'TotalItems']] = frame[['CustomerID', 'Recency', 'Frequency', 'TotalItems']].astype(int)
+    frame['Monetary'] = frame['Monetary'].astype(float)
     return frame.reset_index(drop=True)
 
 
 def data_fingerprint(frame):
     """Mã băm chuẩn hóa dùng chung giữa CSV, SQLite, ứng dụng và notebook."""
     clean = validate(frame)
-    payload = clean.to_json(orient='split', index=False, double_precision=15)
+    payload = clean.to_json(orient='split', index=False, double_precision=10)
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
 # --------------------------------------------------------------------------- 2. Tiền xử lý (IQR + Scaling)
 def detect_outliers_iqr(frame, method='iqr'):
-    """Phát hiện ngoại lai theo quy tắc IQR (1.5 * IQR).
-    - 'iqr': tính IQR trực tiếp trên dữ liệu chi tiêu gốc.
-    - 'iqr_log': tính IQR trên thang log1p (giữ lại nhiều điểm hơn).
-    - 'none': không loại ngoại lai.
-    """
+    """Phát hiện ngoại lai theo quy tắc IQR (1.5 * IQR) trên Recency, Frequency, Monetary."""
     if method == 'none':
         return np.zeros(len(frame), dtype=bool), None
     values = np.log1p(frame[FEATURES]) if method == 'iqr_log' else frame[FEATURES].astype(float)
@@ -88,14 +117,13 @@ def detect_outliers_iqr(frame, method='iqr'):
     lower = q1 - 1.5 * iqr
     upper = q3 + 1.5 * iqr
     mask = ((values < lower) | (values > upper)).any(axis=1).to_numpy()
-    if (~mask).sum() < 10:
+    if (~mask).sum() < 15:
         return np.zeros(len(frame), dtype=bool), None
     bounds = {'method': method, 'lower': lower.to_dict(), 'upper': upper.to_dict()}
     return mask, bounds
 
 
 def make_scaler(scaler_type='standard', use_log=False):
-    """Tạo bộ chuẩn hóa dữ liệu: StandardScaler hoặc MinMaxScaler (có thể kèm log1p)."""
     scaler = MinMaxScaler() if scaler_type == 'minmax' else StandardScaler()
     if use_log:
         return Pipeline([('log', FunctionTransformer(np.log1p, validate=True)), ('scale', scaler)])
@@ -103,7 +131,6 @@ def make_scaler(scaler_type='standard', use_log=False):
 
 
 def prepare(frame, scaler_type='standard', outlier_method='iqr', use_log=False):
-    """Tiền xử lý: phát hiện ngoại lai bằng IQR trên tập sạch -> fit scaler trên dữ liệu không ngoại lai."""
     outlier, bounds = detect_outliers_iqr(frame, method=outlier_method)
     prep = make_scaler(scaler_type=scaler_type, use_log=use_log)
     prep.fit(frame.loc[~outlier, FEATURES])
@@ -148,12 +175,11 @@ def make_model(algorithm, params):
 
 
 def dbscan_grid(scaler_type):
-    """Lưới tham số DBSCAN phù hợp với thang đo của StandardScaler và MinMaxScaler."""
     if scaler_type == 'minmax':
-        eps_values = [0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5]
+        eps_values = [0.06, 0.08, 0.1, 0.12, 0.15]
     else:
-        eps_values = [0.75, 1.0, 1.1, 1.2, 1.35, 1.5, 1.75]
-    return [('DBSCAN', {'eps': eps, 'min_samples': m}) for eps in eps_values for m in [3, 4, 5, 6]]
+        eps_values = [0.35, 0.4, 0.45, 0.5, 0.6]
+    return [('DBSCAN', {'eps': eps, 'min_samples': m}) for eps in eps_values for m in [10, 20, 30, 50]]
 
 
 @dataclass
@@ -178,8 +204,8 @@ class SearchResult:
 
 def search(frame, scaler_type='standard', outlier_method='iqr', use_log=False):
     frame = validate(frame)
-    if len(frame) < 15:
-        raise ValueError('Cần ít nhất 15 khách hàng để khảo sát phân cụm.')
+    if len(frame) < 20:
+        raise ValueError('Cần ít nhất 20 khách hàng để khảo sát phân cụm.')
     prep, X, outlier, bounds = prepare(frame, scaler_type=scaler_type, outlier_method=outlier_method, use_log=use_log)
     X_fit = X[~outlier]
     rows, candidates = [], {}
@@ -193,8 +219,9 @@ def search(frame, scaler_type='standard', outlier_method='iqr', use_log=False):
         elapsed = time.perf_counter() - start
         scores = evaluate(X_fit, labels)
         counts = pd.Series(labels[labels != -1]).value_counts()
+        min_c = 2 if algorithm == 'DBSCAN' else MIN_SEGMENTS
         eligible = (
-            scores['clusters'] >= MIN_SEGMENTS
+            scores['clusters'] >= min_c
             and scores['noise_rate'] <= 0.30
             and len(counts) > 0
             and counts.min() >= 5
@@ -209,7 +236,6 @@ def search(frame, scaler_type='standard', outlier_method='iqr', use_log=False):
     table = pd.DataFrame(rows)
     ranked = table[table.eligible].sort_values(['silhouette', 'davies_bouldin'], ascending=[False, True])
     if ranked.empty:
-        # Dự phòng nếu tập dữ liệu thử nghiệm nhỏ không đạt ngưỡng 3 cụm
         ranked = table[table.silhouette.notna()].sort_values(['silhouette', 'davies_bouldin'], ascending=[False, True])
     if ranked.empty:
         raise ValueError('Không có cấu hình phân cụm hợp lệ. Hãy kiểm tra dữ liệu.')
@@ -220,7 +246,6 @@ def search(frame, scaler_type='standard', outlier_method='iqr', use_log=False):
             options = table[table.algorithm == name].sort_values(['silhouette', 'davies_bouldin'], ascending=[False, True], na_position='last')
         representatives.append(options.head(1))
     best = pd.concat(representatives, ignore_index=True)
-    # Ưu tiên chọn phương pháp phân cụm toàn bộ (KMeans/Hierarchical) làm mô hình chính nếu ở chế độ Auto
     full_cov = ranked[ranked.algorithm.isin(['KMeans', 'Hierarchical'])]
     selected_id = int(full_cov.iloc[0].candidate) if not full_cov.empty else int(ranked.iloc[0].candidate)
     km = table[table.algorithm == 'KMeans']
@@ -240,7 +265,6 @@ def assign_nearest(X, cents):
 
 
 def full_labels(res, labels_fit):
-    """Nhãn cho mọi khách hàng. Khách ngoại lai (bị loại lúc train) được gán vào cụm gần nhất để tham khảo."""
     labels = np.full(len(res.X), -1, dtype=int)
     labels[~res.outlier] = labels_fit
     cents = centroids(res.X_fit, labels_fit)
@@ -250,7 +274,7 @@ def full_labels(res, labels_fit):
 
 
 def compare_scalers(frame, outlier_method='iqr'):
-    """So sánh 2 bộ chuẩn hóa theo đúng đề cương: StandardScaler vs MinMaxScaler."""
+    """So sánh 2 bộ chuẩn hóa theo đề cương: StandardScaler vs MinMaxScaler."""
     parts = []
     for scaler_type, label in [('standard', 'StandardScaler (Z-score)'), ('minmax', 'MinMaxScaler [0, 1]')]:
         res = search(frame, scaler_type=scaler_type, outlier_method=outlier_method, use_log=False)
@@ -262,34 +286,31 @@ def compare_scalers(frame, outlier_method='iqr'):
     return pd.concat(parts, ignore_index=True)
 
 
-# --------------------------------------------------------------------------- 4. Hồ sơ phân khúc & Gợi ý khuyến mãi
-def describe_segment(cluster, ratio_row, total_ratio, retail_share):
-    """Đặt tên phân khúc và gợi ý khuyến mãi siêu thị dựa trên mức chi tiêu tương đối."""
-    top = ratio_row.dropna().sort_values(ascending=False).head(2).index
-    top_vi = ', '.join(CATEGORY_VI[t] for t in top)
-    food, retail = float(ratio_row[FOOD].mean()), float(ratio_row[RETAIL].mean())
-    if total_ratio < 0.78:
-        kind = 'Khách mua sắm tiết kiệm / quy mô nhỏ'
-        offer = f'Tặng Voucher giảm giá cho đơn hàng tiếp theo và Combo tiết kiệm nhóm {top_vi} để tăng tần suất mua.'
-    elif total_ratio > 1.35 and abs(food - retail) < 0.45 * max(food, retail):
-        kind = 'Khách hàng lớn đa ngành (VIP)'
-        offer = 'Áp dụng thẻ thành viên VIP, chiết khấu bậc thang theo hóa đơn lớn và miễn phí giao hàng tận nơi.'
-    elif retail > 1.25 * food:
-        kind = 'Nhóm ưu tiên Tạp hóa & Gia dụng'
-        offer = f'Khuyến mãi mua nhiều giảm giá (mua 2 tặng 1 / giảm 10% theo thùng) cho nhóm {top_vi}.'
-    elif food > 1.25 * retail:
-        kind = 'Nhóm ưu tiên Thực phẩm Tươi & Đông lạnh'
-        offer = f'Ưu đãi Combo thực phẩm tươi sống + đông lạnh hàng tuần, giảm giá giờ vàng cho {top_vi}.'
+# --------------------------------------------------------------------------- 4. Hồ sơ RFM & Gợi ý khuyến mãi
+def describe_segment(cluster, ratio_row, mean_row):
+    """Đặt tên phân khúc RFM và gợi ý khuyến mãi dựa trên R, F, M tương đối so với trung bình."""
+    r_ratio, f_ratio, m_ratio = float(ratio_row['Recency']), float(ratio_row['Frequency']), float(ratio_row['Monetary'])
+    r_val, f_val, m_val = float(mean_row['Recency']), float(mean_row['Frequency']), float(mean_row['Monetary'])
+
+    if r_ratio >= 1.35:
+        kind = 'Khách hàng ngủ quên / Nguy cơ rời bỏ'
+        offer = 'Gửi Email/SMS tái kích hoạt kèm Voucher giảm giá 15% có thời hạn 7 ngày để kéo khách quay lại.'
+    elif f_ratio >= 1.35 or m_ratio >= 1.35:
+        kind = 'Khách hàng trung thành / Chi tiêu cao'
+        offer = 'Tặng thẻ thành viên VIP, tích điểm nhân đôi và ưu tiên giảm giá cho đơn hàng tiếp theo.'
+    elif r_ratio <= 0.85 and f_ratio < 1.1:
+        kind = 'Khách hàng mới / Tiềm năng phát triển'
+        offer = 'Tặng mã miễn phí vận chuyển (Freeship) và ưu đãi combo cho đơn hàng thứ 2 để tạo thói quen mua.'
     else:
-        kind = 'Khách hàng cân bằng nhiều nhóm hàng'
-        offer = f'Ưu đãi theo ngưỡng giá trị hóa đơn kèm quà tặng dùng thử ở nhóm {top_vi}.'
-    channel = f'{retail_share:.0%} thuộc kênh bán lẻ' if retail_share == retail_share else ''
-    rationale = f'Chi tiêu trung bình bằng {total_ratio:.2f} lần mức chung; nổi bật nhất: {top_vi}.' + (f' {channel}.' if channel else '')
+        kind = 'Khách hàng phổ thông / Mua sắm ổn định'
+        offer = 'Ưu đãi theo ngưỡng giá trị đơn hàng (giảm 10% cho đơn đạt mức tối thiểu) và giới thiệu sản phẩm bán chạy.'
+
+    rationale = f'Trung bình: mua cách đây {r_val:.0f} ngày (R={r_ratio:.2f}x), {f_val:.1f} đơn (F={f_ratio:.2f}x), chi £{m_val:,.0f} (M={m_ratio:.2f}x).'
     return f'Nhóm {cluster} — {kind}', offer, rationale
 
 
 NOISE_TEXT = 'Điểm nhiễu (DBSCAN): xem xét riêng trước khi gửi khuyến mãi.'
-OUTLIER_TEXT = 'Khách hàng chi tiêu đột biến (Ngoại lai IQR): chăm sóc riêng / ưu đãi VIP theo hợp đồng. (Gần với {segment}).'
+OUTLIER_TEXT = 'Khách hàng VIP / Mua buôn đột biến (Ngoại lai IQR): chăm sóc riêng 1-1 & chiết khấu theo đơn hàng lớn. (Gần với {segment}).'
 
 
 def profiles(frame, labels, outlier=None):
@@ -301,8 +322,6 @@ def profiles(frame, labels, outlier=None):
     medians = core.groupby('cluster')[FEATURES].median()
     overall = core[FEATURES].mean().replace(0, np.nan)
     ratios = means.div(overall)
-    total_ratio = means.sum(axis=1) / overall.sum()
-    retail_share = core.groupby('cluster').Channel.apply(lambda s: float((s == 2).mean()))
     rows = []
     for cluster in means.index:
         count = int((labels == cluster).sum())
@@ -310,7 +329,7 @@ def profiles(frame, labels, outlier=None):
         if cluster == -1:
             segment, offer, rationale = 'Ngoại lệ / nhiễu (DBSCAN)', NOISE_TEXT, 'Không nằm trong cụm mật độ nào.'
         else:
-            segment, offer, rationale = describe_segment(int(cluster), ratios.loc[cluster], float(total_ratio[cluster]), float(retail_share[cluster]))
+            segment, offer, rationale = describe_segment(int(cluster), ratios.loc[cluster], means.loc[cluster])
         rows.append({
             'cluster': int(cluster), 'customers': count, 'outliers_assigned': out_count,
             'segment': segment, 'suggestion': offer, 'rationale': rationale,
@@ -320,7 +339,6 @@ def profiles(frame, labels, outlier=None):
 
 def build_assignments(frame, labels, outlier, coords, segments):
     out = frame.copy()
-    out.insert(0, 'row_id', np.arange(1, len(frame) + 1))
     out['cluster'] = labels
     out['is_outlier'] = np.asarray(outlier, dtype=bool)
     out[['PC1', 'PC2']] = coords
@@ -330,7 +348,7 @@ def build_assignments(frame, labels, outlier, coords, segments):
     return out
 
 
-# --------------------------------------------------------------------------- 5. Huấn luyện và lưu phiên
+# --------------------------------------------------------------------------- 5. Huấn luyện & Lưu phiên
 def train(frame, output_root=None, scaler_type='standard', outlier_method='iqr', use_log=False,
           algorithm='Auto', allow_ineligible=False, compare=True):
     frame = validate(frame)
@@ -365,8 +383,6 @@ def train(frame, output_root=None, scaler_type='standard', outlier_method='iqr',
             'assignments': rep_assignments, 'segments': rep_segments,
             'means': rep_means.reset_index(), 'medians': rep_medians.reset_index(),
             'relative_spending': rep_ratios.reset_index(),
-            'channel_distribution': pd.crosstab(rep_assignments.cluster, rep_assignments.Channel, normalize='index').reset_index(),
-            'region_distribution': pd.crosstab(rep_assignments.cluster, rep_assignments.Region, normalize='index').reset_index(),
         }.items():
             values.to_csv(target / f'{name}.csv', index=False, encoding='utf-8-sig')
         joblib.dump({'preprocessor': res.preprocessor, 'model': rep_model, 'pca': pca,
@@ -390,7 +406,7 @@ def train(frame, output_root=None, scaler_type='standard', outlier_method='iqr',
         algorithm=selected.algorithm, params=json.loads(selected.params),
         scaler_type=scaler_type, outlier_method=outlier_method, use_log=use_log,
         eligible=bool(selected.eligible), outliers=int(res.outlier.sum()), elbow_k=res.elbow,
-        selection_policy=f'Silhouette cao nhất (Davies-Bouldin phá hòa); >={MIN_SEGMENTS} cụm, mỗi cụm >=5, nhiễu <=30%',
+        selection_policy=f'Silhouette cao nhất (Davies-Bouldin phá hòa); >={MIN_SEGMENTS} cụm (DBSCAN >=2), nhiễu <=30%',
         metrics=evaluate(res.X_fit, labels_fit), pca_explained_variance=pca.explained_variance_ratio_.tolist(),
         versions={'sklearn': sklearn.__version__, 'numpy': np.__version__, 'pandas': pd.__version__},
     )
@@ -402,14 +418,14 @@ def train(frame, output_root=None, scaler_type='standard', outlier_method='iqr',
     }, folder / 'model.joblib')
 
     report = [
-        '# Báo cáo phiên huấn luyện', '',
+        '# Báo cáo phiên huấn luyện RFM', '',
         f"Phiên: {run_id}; UTC: {metadata['created_utc']}",
         f"Dữ liệu: {len(frame)} khách hàng (loại {int(res.outlier.sum())} ngoại lai bằng {outlier_method} khi huấn luyện).",
         f"Chuẩn hóa: {scaler_type}" + (' + log1p' if use_log else '') + '.', '',
         '## So sánh ba thuật toán', '',
         '```text', best[['algorithm', 'params', 'clusters', 'noise_rate', 'silhouette', 'davies_bouldin', 'calinski_harabasz', 'eligible']].to_string(index=False), '```', '',
         f"Mô hình chính: {selected.algorithm} {selected.params}; Elbow gợi ý k={res.elbow}.", '',
-        '## Hồ sơ phân khúc & gợi ý khuyến mãi', '',
+        '## Hồ sơ phân khúc RFM & gợi ý khuyến mãi', '',
         '```text', segment[['cluster', 'customers', 'segment', 'suggestion']].to_string(index=False), '```',
     ]
     (folder / 'RUN_REPORT.md').write_text('\n'.join(report), encoding='utf-8')
@@ -431,7 +447,7 @@ def latest_run(root=None):
 
 
 def predict_segments(frame, folder=None):
-    """Gán phân khúc và gợi ý khuyến mãi ngay cho khách hàng mới vừa nhập."""
+    """Gán phân khúc RFM và gợi ý khuyến mãi ngay cho khách hàng mới."""
     folder = Path(folder) if folder else latest_run()
     if folder is None or not (folder / 'model.joblib').exists():
         return None
@@ -462,7 +478,7 @@ def predict_segments(frame, folder=None):
     return result
 
 
-def retrain_due(rows_now, root=None, min_new=10, max_days=7, now=None):
+def retrain_due(rows_now, root=None, min_new=20, max_days=7, now=None):
     """Chính sách huấn luyện định kỳ: khi có >= N khách mới hoặc quá X ngày kể từ lần huấn luyện trước."""
     folder = latest_run(root)
     if folder is None:

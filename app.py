@@ -8,35 +8,35 @@ from sklearn.neighbors import NearestNeighbors
 import streamlit as st
 
 from pipeline import (
-    FEATURES, COLUMNS, CATEGORY_VI, train, validate, search,
+    FEATURES, COLUMNS, FEATURE_VI, train, validate, search,
     latest_run, predict_segments, retrain_due,
 )
 from storage import initialize, load_data, add_batch, history
 from experience import render_results_tab
 
-st.set_page_config(page_title='Phân khúc khách hàng siêu thị', layout='wide')
-st.title('Phân khúc khách hàng siêu thị để gợi ý khuyến mãi')
-st.caption('Bài toán Phân cụm · Bộ dữ liệu Wholesale Customers (UCI, 440 dòng) · K-Means / Hierarchical / DBSCAN')
+st.set_page_config(page_title='Phân khúc khách hàng bán lẻ (RFM)', layout='wide')
+st.title('Phân khúc khách hàng bán lẻ (RFM) để gợi ý khuyến mãi')
+st.caption('Bài toán Phân cụm · Bộ dữ liệu Online Retail (UCI 352: 541,909 giao dịch → 4,338 khách hàng RFM) · K-Means / Hierarchical / DBSCAN')
 initialize()
 data = load_data()
 
 # ---- Thanh bên: Trạng thái kho dữ liệu & Chính sách huấn luyện định kỳ ----
-st.sidebar.metric('Khách hàng trong kho', len(data))
+st.sidebar.metric('Khách hàng trong kho (RFM)', f'{len(data):,}')
 st.sidebar.subheader('Huấn luyện định kỳ')
 auto_retrain = st.sidebar.checkbox('Tự huấn luyện lại khi đến hạn', value=True, key='policy_auto')
-min_new = st.sidebar.number_input('Khi có ≥ N khách hàng mới', min_value=1, value=10, step=1, key='policy_min_new')
+min_new = st.sidebar.number_input('Khi có ≥ N khách hàng mới', min_value=1, value=20, step=1, key='policy_min_new')
 max_days = st.sidebar.number_input('hoặc sau X ngày có dữ liệu mới', min_value=1, value=7, step=1, key='policy_max_days')
 due, reason = retrain_due(len(data), min_new=int(min_new), max_days=int(max_days))
 folder_now = latest_run()
 if folder_now is not None:
     last_meta = json.loads((folder_now / 'metadata.json').read_text(encoding='utf-8'))
-    st.sidebar.caption(f"Phiên hiện tại: {last_meta['algorithm']} {last_meta['params']} ({last_meta['scaler_type']}) · {last_meta['rows']} KH")
+    st.sidebar.caption(f"Phiên hiện tại: {last_meta['algorithm']} {last_meta['params']} ({last_meta['scaler_type']}) · {last_meta['rows']:,} KH")
 st.sidebar.caption(('⏰ Đến hạn: ' if due else '✅ ') + reason)
 if due and auto_retrain and not st.session_state.get('auto_train_failed'):
     try:
         with st.spinner(f'Đang tự huấn luyện lại: {reason}'):
             train(data)
-        st.toast('Đã cập nhật mô hình phân khúc mới.')
+        st.toast('Đã cập nhật mô hình phân khúc RFM mới.')
     except ValueError as error:
         st.session_state['auto_train_failed'] = True
         st.error(f'Huấn luyện tự động thất bại: {error}')
@@ -53,29 +53,31 @@ tabs = st.tabs([
 # TAB 1: TỔNG QUAN & KHÁM PHÁ DỮ LIỆU (EDA)
 # ==============================================================================
 with tabs[0]:
-    st.subheader('Tổng quan bộ dữ liệu Wholesale Customers (UCI)')
-    st.write('Mỗi dòng ghi nhận chi tiêu hàng năm của một khách hàng theo 6 nhóm mặt hàng: '
-             '**Tươi sống (`Fresh`), Sữa (`Milk`), Tạp hóa (`Grocery`), Đông lạnh (`Frozen`), '
-             'Chất tẩy rửa & giấy (`Detergents_Paper`), Thực phẩm chế biến (`Delicassen`)**.')
+    st.subheader('Tổng quan bộ dữ liệu Online Retail (UCI 352) & Mô hình RFM')
+    st.write('Từ **541,909 dòng giao dịch gốc**, sau khi làm sạch (loại 135,080 dòng thiếu `CustomerID`, '
+             '8,905 hóa đơn hủy `C*`, 40 dòng `Quantity/UnitPrice ≤ 0` → còn **397,884 giao dịch hợp lệ**), '
+             'hệ thống tổng hợp thành **3 chỉ số RFM** cho từng khách hàng: '
+             '**Recency** (số ngày từ lần mua cuối), **Frequency** (số đơn hàng), **Monetary** (tổng chi tiêu £).')
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric('Số dòng', len(data))
-    c2.metric('Số cột', data.shape[1])
+    c1.metric('Tổng khách hàng (RFM)', f'{len(data):,}')
+    c2.metric('Số quốc gia', int(data['Country'].nunique()))
     c3.metric('Giá trị thiếu (Missing)', int(data.isna().sum().sum()))
-    c4.metric('Kênh bán lẻ (Channel=2)', int((data.Channel == 2).sum()))
+    c4.metric('Chi tiêu trung vị (£)', f"£{data['Monetary'].median():,.1f}")
 
     st.subheader('Phát hiện ngoại lai (Outliers) bằng quy tắc IQR — Boxplot')
-    fig, ax = plt.subplots(figsize=(11, 4))
-    ax.boxplot([data[col] for col in FEATURES], tick_labels=[CATEGORY_VI[c] for c in FEATURES], orientation='vertical')
-    ax.set_ylabel('Chi tiêu năm (đơn vị gốc)')
-    ax.set_title('Biểu đồ Boxplot 6 nhóm hàng trước khi loại bỏ ngoại lai')
-    plt.xticks(rotation=15)
+    fig, axes = plt.subplots(1, 3, figsize=(13, 3.8))
+    for ax, col in zip(axes, FEATURES):
+        ax.boxplot(data[col], orientation='vertical')
+        ax.set_title(FEATURE_VI[col])
+        ax.set_xticks([])
     fig.tight_layout()
     st.pyplot(fig)
     plt.close(fig)
-    st.caption('Các dấu tròn phía trên râu Boxplot là giá trị ngoại lai (vượt quá Q3 + 1.5×IQR) cần xử lý ở bước tiền xử lý để không làm lệch tâm cụm.')
+    st.caption('Các dấu tròn phía trên râu Boxplot là các khách hàng ngoại lai (vượt Q3 + 1.5×IQR, ví dụ khách mua buôn chi hàng chục nghìn bảng Anh).')
 
-    with st.expander('Xem bảng dữ liệu gốc & Thống kê mô tả'):
-        st.dataframe(data, width='stretch')
+    with st.expander('Xem bảng dữ liệu RFM & Thống kê mô tả'):
+        st.dataframe(data.head(200), width='stretch')
         st.dataframe(data[FEATURES].describe().T, width='stretch')
 
 
@@ -97,9 +99,13 @@ with tabs[1]:
     )
     use_log_opt = col_p3.checkbox('Biến đổi Log1p trước chuẩn hóa', value=False)
 
-    res = search(data, scaler_type=scaler_opt, outlier_method=outlier_opt, use_log=use_log_opt)
-    st.info(f'Sau tiền xử lý: giữ **{int((~res.outlier).sum())}/{len(data)}** khách hàng đạt chuẩn để huấn luyện '
-            f'(đã tách riêng **{int(res.outlier.sum())}** ngoại lai). Phương pháp Khuỷu tay gợi ý **k = {res.elbow}**.')
+    @st.cache_data(show_spinner='Đang khảo sát tham số cho 3 thuật toán...')
+    def cached_search(_hash, df, sc, out, log):
+        return search(df, scaler_type=sc, outlier_method=out, use_log=log)
+
+    res = cached_search(len(data), data, scaler_opt, outlier_opt, use_log_opt)
+    st.info(f'Sau tiền xử lý: giữ **{int((~res.outlier).sum()):,}/{len(data):,}** khách hàng chuẩn để huấn luyện '
+            f'(tách riêng **{int(res.outlier.sum()):,}** khách ngoại lai VIP). Phương pháp Khuỷu tay gợi ý **k = {res.elbow}**.')
 
     st.subheader('1. Đánh giá K-Means & Hierarchical: Elbow Method và Silhouette Score')
     km = res.table[res.table.algorithm == 'KMeans'].copy()
@@ -132,9 +138,9 @@ with tabs[1]:
         plt.close(fig)
     with c_kd:
         fig, ax = plt.subplots(figsize=(6, 4))
-        dists = np.sort(NearestNeighbors(n_neighbors=4).fit(res.X_fit).kneighbors(res.X_fit)[0][:, -1])
+        dists = np.sort(NearestNeighbors(n_neighbors=10).fit(res.X_fit).kneighbors(res.X_fit)[0][:, -1])
         ax.plot(dists, color='#0d9488')
-        ax.set(title='Biểu đồ k-distance (chọn eps cho DBSCAN)', xlabel='Khách hàng sắp xếp tăng dần', ylabel='Khoảng cách láng giềng thứ 4')
+        ax.set(title='Biểu đồ k-distance (chọn eps cho DBSCAN, k=10)', xlabel='Khách hàng sắp xếp tăng dần', ylabel='Khoảng cách láng giềng thứ 10')
         fig.tight_layout()
         st.pyplot(fig)
         plt.close(fig)
@@ -167,33 +173,34 @@ with tabs[3]:
     col_form, col_train = st.columns([1.2, 1])
 
     with col_form:
-        st.subheader('Nhập khách hàng mới (gán phân khúc ngay lập tức)')
+        st.subheader('Nhập khách hàng mới (dự đoán phân khúc RFM ngay)')
+        next_id = int(data['CustomerID'].max()) + 1
         presets = {
-            'Khách mua sắm tiết kiệm': dict(Channel=1, Region=3, Fresh=3000., Milk=1200., Grocery=1500., Frozen=1000., Detergents_Paper=400., Delicassen=500.),
-            'Cửa hàng tạp hóa / gia dụng': dict(Channel=2, Region=1, Fresh=4000., Milk=8500., Grocery=12000., Frozen=1200., Detergents_Paper=4500., Delicassen=800.),
-            'Nhà hàng / Tươi sống & Đông lạnh': dict(Channel=1, Region=3, Fresh=18000., Milk=2000., Grocery=2500., Frozen=5500., Detergents_Paper=500., Delicassen=1200.),
+            'Khách mới tiềm năng': dict(Recency=15, Frequency=2, Monetary=450., TotalItems=220),
+            'Khách trung thành VIP': dict(Recency=10, Frequency=8, Monetary=2800., TotalItems=1500),
+            'Khách sắp rời bỏ': dict(Recency=250, Frequency=1, Monetary=250., TotalItems=110),
         }
         p_cols = st.columns(3)
         for idx, (label, vals) in enumerate(presets.items()):
             if p_cols[idx].button(f'Mẫu: {label}', key=f'preset_{idx}'):
-                st.session_state['in_channel'] = vals['Channel']
-                st.session_state['in_region'] = vals['Region']
-                for feat in FEATURES:
-                    st.session_state[f'in_{feat}'] = vals[feat]
+                st.session_state['in_cid'] = next_id
+                for k, v in vals.items():
+                    st.session_state[f'in_{k}'] = v
 
         with st.form('customer'):
             c_a, c_b = st.columns(2)
-            channel = c_a.selectbox('Channel', [1, 2], key='in_channel',
-                                    format_func=lambda x: {1: '1 — Khách sạn / Nhà hàng', 2: '2 — Bán lẻ / Siêu thị'}[x])
-            region = c_b.selectbox('Region', [1, 2, 3], key='in_region',
-                                   format_func=lambda x: {1: '1 — Lisbon', 2: '2 — Oporto', 3: '3 — Khác'}[x])
+            cid = c_a.number_input('Mã khách hàng (CustomerID)', min_value=1, step=1,
+                                   value=int(st.session_state.get('in_cid', next_id)), key='in_cid')
+            country = c_b.text_input('Quốc gia (Country)', value='United Kingdom', key='in_Country')
             f_cols = st.columns(2)
-            values = {}
-            for i, col in enumerate(FEATURES):
-                values[col] = f_cols[i % 2].number_input(
-                    f'{CATEGORY_VI[col]} ({col})', min_value=0., step=100.,
-                    value=float(st.session_state.get(f'in_{col}', 0.)), key=f'in_{col}',
-                )
+            recency = f_cols[0].number_input('Recency (số ngày từ lần mua cuối)', min_value=0, step=1,
+                                             value=int(st.session_state.get('in_Recency', 30)), key='in_Recency')
+            frequency = f_cols[1].number_input('Frequency (số đơn hàng)', min_value=1, step=1,
+                                               value=int(st.session_state.get('in_Frequency', 1)), key='in_Frequency')
+            monetary = f_cols[0].number_input('Monetary (tổng chi tiêu £)', min_value=0.0, step=50.0,
+                                              value=float(st.session_state.get('in_Monetary', 0.0)), key='in_Monetary')
+            items = f_cols[1].number_input('Tổng số sản phẩm (TotalItems)', min_value=1, step=10,
+                                           value=int(st.session_state.get('in_TotalItems', 50)), key='in_TotalItems')
             confirmed = st.checkbox('Đã kiểm tra đây là khách hàng mới và số liệu hợp lệ')
             submit = st.form_submit_button('Lưu & Dự đoán phân khúc', type='primary')
 
@@ -202,9 +209,10 @@ with tabs[3]:
                 st.warning('Cần đánh dấu xác nhận trước khi lưu.')
             else:
                 try:
-                    new = pd.DataFrame([dict(Channel=channel, Region=region, **values)])
+                    new = pd.DataFrame([dict(CustomerID=cid, Recency=recency, Frequency=frequency,
+                                             Monetary=monetary, TotalItems=items, Country=country)])
                     count = add_batch(new, 'Nhập từ biểu mẫu')
-                    st.session_state['save_notice'] = f'Đã lưu {count} khách hàng mới vào CSDL.' if count else 'Bản ghi giống hệt đã tồn tại; không thêm trùng.'
+                    st.session_state['save_notice'] = f'Đã lưu {count} khách hàng mới vào SQLite.' if count else 'Bản ghi giống hệt đã tồn tại; không thêm trùng.'
                     st.session_state['save_prediction'] = predict_segments(new) if count else None
                     st.rerun()
                 except ValueError as error:
@@ -217,13 +225,13 @@ with tabs[3]:
             with st.container(border=True):
                 st.markdown('**Kết quả phân khúc & khuyến mãi cho khách hàng vừa nhập:**')
                 for row in pred.itertuples():
-                    st.write(f'• Phân khúc: **{row.segment}**' + (' · ⚠️ Ngoại lai' if row.is_outlier else ''))
+                    st.write(f'• KH-{row.CustomerID}: **{row.segment}**' + (' · ⭐ Ngoại lai VIP' if row.is_outlier else ''))
                     st.info(row.suggestion)
 
         st.divider()
         st.subheader('Nhập hàng loạt từ CSV')
-        st.download_button('Tải file mẫu CSV', pd.DataFrame(columns=COLUMNS).to_csv(index=False).encode('utf-8-sig'), 'customer_template.csv', 'text/csv')
-        uploaded = st.file_uploader('Chọn file CSV (đủ 8 cột)', type='csv')
+        st.download_button('Tải file mẫu CSV', pd.DataFrame(columns=COLUMNS).to_csv(index=False).encode('utf-8-sig'), 'retail_rfm_template.csv', 'text/csv')
+        uploaded = st.file_uploader('Chọn file CSV (đủ 6 cột RFM)', type='csv')
         if uploaded is not None:
             try:
                 incoming = validate(pd.read_csv(uploaded))
@@ -239,7 +247,7 @@ with tabs[3]:
 
     with col_train:
         st.subheader('Huấn luyện lại mô hình')
-        st.write('Chọn cấu hình và bấm nút để huấn luyện lại trên toàn bộ dữ liệu hiện có trong SQLite:')
+        st.write('Chọn cấu hình và bấm nút để huấn luyện lại trên toàn bộ kho dữ liệu hiện có:')
         alg_opt = st.selectbox('Thuật toán chính', ['Auto', 'KMeans', 'Hierarchical', 'DBSCAN'])
         sc_opt = st.selectbox('Bộ chuẩn hóa', ['standard', 'minmax'], format_func=lambda x: 'StandardScaler' if x == 'standard' else 'MinMaxScaler', key='tr_sc')
         out_opt = st.selectbox('Xử lý ngoại lai', ['iqr', 'iqr_log', 'none'], format_func=lambda x: {'iqr': 'IQR trực tiếp', 'iqr_log': 'IQR (Log1p)', 'none': 'Không loại'}[x], key='tr_out')

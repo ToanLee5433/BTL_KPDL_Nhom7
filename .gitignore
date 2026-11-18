@@ -10,3 +10,4 @@ __pycache__/
 artifacts/
 figures/
 notebook_run/
+data/*.xlsx

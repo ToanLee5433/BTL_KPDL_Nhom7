@@ -18,7 +18,7 @@ def main():
     parser.add_argument('--use-log', action='store_true', help='Biến đổi log1p trước khi chuẩn hóa.')
     parser.add_argument('--allow-ineligible', action='store_true', help='Cho phép lưu cấu hình chưa đạt tiêu chí.')
     parser.add_argument('--if-due', action='store_true', help='Chỉ huấn luyện khi đủ khách mới hoặc quá hạn ngày.')
-    parser.add_argument('--min-new', type=int, default=10, help='Ngưỡng số khách hàng mới (dùng với --if-due).')
+    parser.add_argument('--min-new', type=int, default=20, help='Ngưỡng số khách hàng mới (dùng với --if-due).')
     parser.add_argument('--max-days', type=int, default=7, help='Ngưỡng số ngày (dùng với --if-due).')
     args = parser.parse_args()
     initialize()
